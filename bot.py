@@ -1,22 +1,30 @@
 # bot.py
 import os
 import json
+import time
+
 import discord
 
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-GUILD = os.getenv('DISCORD_GUILD')
 CONFIG = os.getenv('CONFIG')
 
 class JSONConfig(dict):
+
+    class SetEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, set):
+                return list(obj)
+            return json.JSONEncoder.default(self, obj)
+
     def __init__(self, *args):
         dict.__init__(self, *args)
 
     def save_config(self):
         with open(CONFIG, 'w') as f:
-            json.dump(self, f)
+            json.dump(self, f, cls=self.SetEncoder)
 
     def get(self, key, default):
         if key not in self:
@@ -30,8 +38,11 @@ class JSONConfig(dict):
 try:
     with open(CONFIG, 'r') as f:
         config = JSONConfig(json.load(f))
-except FileNotFoundError:
+except:
     config = JSONConfig()
+
+if 'whitelist' in config:
+    config['whitelist'] = set(config['whitelist'])
 
 intents = discord.Intents.default()
 intents.members = True
@@ -69,6 +80,13 @@ homoglypths['z'] = U'\u007a\u1d22\uab93\uff5a\U000118c4\U0001d433\U0001d467\U000
 banned_words = config.get('banned_words', [])
 allowed_roles = config.get('allowed_roles', [])
 whitelist = config.get('whitelist', {})
+banned_users = config.get('banned_users', {})
+
+notif_channel = None
+
+last_massban = None
+last_massban_ts = -1
+last_massban_mod = None
 
 def standardize_string(s: str) -> str:
     standardized = ''
@@ -81,7 +99,13 @@ def standardize_string(s: str) -> str:
         if default:
             standardized += c
     # simplify similar characters further
-    return standardized.replace('e', 'c').replace('y','v').replace('u','v').replace('vv', 'w').replace('i', 'l')
+    return standardized.replace('e', 'c')\
+                       .replace('y','v')\
+                       .replace('u','v')\
+                       .replace('vv', 'w')\
+                       .replace('i', 'l')\
+                       .replace('1', 'l')\
+                       .replace('0', 'o')
     
 def add_banned_word(s: str):
     banned_words.append(s)
@@ -89,20 +113,74 @@ def add_banned_word(s: str):
     config.save_config()
     
 def remove_banned_word(s: str):
-    banned_words.discard(s)
-    banned_words_converted.discard(standardize_string(s))
+    banned_words.remove(s)
+    banned_words_converted.remove(standardize_string(s))
     config.save_config()
 
+# Should be okay as list since relatively low number of words
 banned_words_converted = [standardize_string(s) for s in banned_words]
+
+
+user_ids = []
+user_names_standardized = []
+modmail_blacklist = dict()
+def maybe_blacklist_modmail_name(user_id: int, user_name: str):
+    global user_ids, user_names_standardized, modmail_blacklist
+    if user_id in user_ids:
+        return
+    standardized_to_check = standardize_string(user_name)
+    if standardized_to_check in user_names_standardized:
+        # If we find the same standardized name within 10 modmail requests (spam), mark it blocked for one hour
+        modmail_blacklist[standardized_to_check] = time.time()
+        print(f'Blocked f{standardized_to_check} for 1h.')
+    elif len(user_ids) > 10:
+        user_ids = user_ids[1:]
+        user_names_standardized = user_names_standardized[1:]
+        user_ids.append(user_id)
+        user_names_standardized.append(standardized_to_check)
 
 @client.event
 async def on_ready():
+    global notif_channel
     game = discord.Game("Checking For Scammers")
     await client.change_presence(status=discord.Status.idle, activity=game)
+    guild_id = config.get('guild', None)
+    if guild_id:
+        channel_id = config.get('channel', None)
+        if channel_id:
+            notif_guild = await client.fetch_guild(guild_id)
+            channels = await notif_guild.fetch_channels()
+            for channel in channels:
+                if channel.id == channel_id:
+                    notif_channel = channel
+                    break
     print(f'{client.user.name} has connected to Discord!')
 
 @client.event
+async def on_member_update(before, after):
+    if not notif_channel:
+        return
+    if after.name in whitelist:
+        return
+    standardized = standardize_string(after.name) 
+    for i, word in enumerate(banned_words_converted):
+        if word in standardized:
+            print(after.name)
+            print('Changed bad')
+            invite = await notif_channel.create_invite()
+            await after.create_dm()
+            await after.dm_channel.send(
+                    f'Hello {after.name},\nUnfortunately you have been KICKED for having the word "{banned_words[i]}" in your name (or similar).\nPlease change your name before attempting to rejoin the server or you will be banned.\n{invite.url}'
+                )
+            await notif_channel.guild.kick(after)
+            return
+
+@client.event
 async def on_member_join(member):
+
+    if member.guild.id == 884176665511624786:  # Hardcoded shared server
+        return
+
     if member.name in whitelist:
         return
 
@@ -111,96 +189,153 @@ async def on_member_join(member):
         if word in converted_name:
             await member.create_dm()
             await member.dm_channel.send(
-                    f'Hello {member.name},\nUnfortunately you have been banned for having the word "{banned_words[i]}" in your name (or similar).\nIf you believe this to be an error, please respond in this DM. (Not done yet.)'
+                    f'Hello {member.name},\nUnfortunately you have been BANNED for having the word "{banned_words[i]}" in your name (or similar).\nIf you believe this to be an error, please join https://discord.gg/yaAGGVFtXp then please respond in this DM.'
                 )
             await member.guild.ban(member, reason='bad name')
-            return
+            return 
 
+# TODO: Make this better
+channel_cache = dict()
 @client.event
 async def on_message(message):
-    if message.author == client.user:
+    global notif_channel, channel_cache, banned_users
+    if message.author == client.user or message.author.id in banned_users:
+        return
+    
+    if notif_channel and message.channel == notif_channel and message.reference and message.author.guild_permissions.ban_members:
+        msg = message.reference.cached_message
+        if not msg:
+            msg = await notif_channel.fetch_message(message.reference.message_id)
+        if msg.author != client.user:
+            return
+        if message.content == '!raven doubleban':
+            banned_users.add(message.author.id)
+            await notif_channel.send("Banned. No more messages will be recieved from them.")
+            return
+        elif message.content == '!raven unban':
+            person = client.get_user(int(msg.content))
+            if not person:
+                person = await client.fetch_user(int(msg.content))
+
+            whitelist.add(person.name)
+            await notif_channel.guild.unban(person)
+            await notif_channel.send("User unbanned.")
+            # TODO: Find a better way to do this
+            for chan in client.private_channels:
+                if chan.recipient.id == int(msg.content):
+                    invite = await notif_channel.create_invite()
+                    await chan.send(f'You have been unbanned! Please rejoin here: {invite.url}')
+                    return
+
+            return
+        else:
+            # TODO: Find a better way to do this
+            for chan in client.private_channels:
+                if chan.recipient.id == int(msg.content):
+                    await chan.send(message.content)
+                    return
+
+    if isinstance(message.channel, discord.DMChannel):
+        if not notif_channel:
+            print("Tried to notify, but no notify channel!!!\n\n{}\n{}".format(message.channel.recipient.id, message.content))
+            return
+        # See if there's a way not to make these API calls
+        #member = await notif_channel.guild.fetch_member(message.channel.recipient.id)
+        #try:
+        #    ban = await notif_channel.guild.fetch_ban(member)
+        #except:
+        #    ban = None
+        #if not ban:
+            # User is not banned, do not communicate
+        #    return
+
+        global modmail_blacklist
+        maybe_blacklist_modmail_name(message.channel.recipient.id, message.channel.recipient.name)
+        s_name = standardize_string(message.channel.recipient.name)
+        if s_name in modmail_blacklist:
+            last_ts = modmail_blacklist[s_name]
+            delta = time.time() - last_ts
+            if delta > 60 * 60:
+                del modmail_blacklist[s_name]
+            else:
+                await message.channel.send('You are currently unable to send modmail messages due to multiple accounts having your same name making requests. Please try again in an hour.')
+                return
+        
+        embed = discord.Embed()
+        embed.set_author(name='#'.join([str(message.channel.recipient.name),str(message.channel.recipient.discriminator)]))
+        embed.add_field(name='Message', value=message.content, inline=True)
+        embed.set_footer(text='Reply to this message to reply to this user. Reply with !raven doubleban to prevent this user from messaging. Reply with !raven unban to unban this user, whitelist their name, and give them an invite back to the server.')
+
+        await notif_channel.send(message.channel.recipient.id, embed=embed)
         return
 
     content = str(message.content).split(' ')
 
-    if content[0] == '!raven':
-        
-        if len(content) == 1:
-            content.append('help')
+    tri = len(content) >= 3
 
-        member = await message.guild.fetch_member(message.author.id)
-        if not (set([x.id for x in member.roles]) & set(allowed_roles)):
+    if content[0] == '!raven':
+
+        # Only users who have permission to ban users in the discord may use this bot.
+        if not message.author.guild_permissions.ban_members:
             await message.channel.send(f"<@{message.author.id}> you do not have permission to send RavenBot commands!")
-        else:
-            if content[1] == 'help':
-                await message.channel.send("help\naddrole\nremoverole")
-            elif content[1] == 'addrole':
-                if len(content) == 2:
-                    await message.channel.send('!raven addrole {role}\nAllow a certain role to use RavenBot.')
-                else:
-                    role = content[2]
-                    try:
-                        role = int(role)
-                        role = message.guild.get_role(role)
-                        if role is None:
-                            await message.channel.send('That role doesn\'t exist!')
-                        else:
-                            allowed_roles.append(role.id)
-                            config.save_config()
-                            await message.channel.send(f'Added role {safe_name}')
-                        return
-                    except:
-                        role = role.replace('@','')
-                        for r in message.guild.roles:
-                            safe_name = r.name.replace('@','')
-                            if role == safe_name:
-                                allowed_roles.append(r.id)
-                                config.save_config()
-                                await message.channel.send(f'Added role {safe_name}')
-                                return
-                        await message.channel.send('That role doesn\'t exist!')
-            elif content[1] == 'removerole':
-                if len(content) == 2:
-                    await message.channel.send('!raven removerole {role}\nDisallow a certain role to use RavenBot.')
-                else:
-                    role = content[2]
-                    try:
-                        role = int(role)
-                        role = message.guild.get_role(role)
-                        if role is None:
-                            await message.channel.send('That role doesn\'t exist!')
-                        else:
-                            try:
-                                allowed_roles.remove(role.id)
-                            except ValueError:
-                                await message.channel.send(f'Role {safe_name} was never allowed to use RavenBot!')
-                                return
-                            config.save_config()
-                            await message.channel.send(f'Removed role {safe_name}')
-                        return
-                    except:
-                        role = role.replace('@','')
-                        for r in message.guild.roles:
-                            safe_name = r.name.replace('@','')
-                            if role == safe_name:
-                                try:
-                                    allowed_roles.remove(r.id)
-                                except ValueError:
-                                    await message.channel.send(f'Role {safe_name} was never allowed to use RavenBot!')
-                                    return
-                                config.save_config()
-                                await message.channel.send(f'Removed role {safe_name}')
-                                return
-                        await message.channel.send('That role doesn\'t exist!')
-            elif content[1] == 'addword':
-                pass
-            elif content[1] == 'removeword':
-                pass
-            elif content[1] == 'whitelist':
-                pass
-            elif content[1] == 'unwhitelist':
-                pass
+            return
+
+        if content[1] == 'addword' and tri:
+            add_banned_word(content[2])
+            await message.channel.send(f"{content[2]} added to the banned words list.")
+        elif content[1] == 'removeword' and tri:
+            if content[2] in banned_words:
+                remove_banned_word(content[2])
+                await message.channel.send(f"{content[2]} removed from the banned words list.")
             else:
-                await message.channel.send("Unknown command!")
+                await message.channel.send(f"{content[2]} is not in the banned words list!")
+        elif content[1] == 'words':
+            await message.channel.send(f"{banned_words}")
+        elif content[1] == 'channel':
+            config['channel'] = message.channel.id
+            config['guild'] = message.channel.guild.id
+            notif_channel = message.channel
+            await message.channel.send("Notifications will now be sent to this channel.")
+        elif content[1] == 'unchannel':
+            config['channel'] = None
+            notif_channel = None
+            await message.channel.send("Notifications will no longer be sent.")
+        elif content[1] == 'massban' and tri:
+            global last_massban, last_massban_ts, last_massban_mod
+
+            send_info = False
+
+            if last_massban != content[2]:
+                send_info = True
+                last_massban = content[2]
+                last_massban_ts = time.time()
+                last_massban_mod = message.author
+            elif time.time() - last_massban_ts > 60:
+                send_info = True
+                last_massban_ts = time.time()
+                last_massban_mod = message.author
+            elif last_massban_mod == message.author:
+                send_info = True
+
+            if send_info:
+                await message.channel.send("Two moderators must type the same massban command within 1 minute in order for it to execute.")
+                return
+
+            last_massban = None
+            last_massban_ts = -1
+            last_massban_author = None
+
+            standard_test = standardize_string(" ".join(content[2:]).replace("\"","").lower())
+
+            for bad in [x for x in message.channel.guild.members if standardize_string(x.name) == standard_test]:
+                await bad.create_dm()
+                await bad.dm_channel.send(
+                    f'Hello {bad.name},\nUnfortunately you have been banned in a mass ban based on name.\nIf you believe this to be an error, please join https://discord.gg/yaAGGVFtXp then please respond in this DM.'
+                )
+                await message.channel.guild.ban(bad, reason='mass ban')
+        elif content[1] == 'help':
+            await message.channel.send("addword, removeword, words, channel, unchannel, massban")
+        else:
+            await message.channel.send("Unknown command!")
 
 client.run(TOKEN)
